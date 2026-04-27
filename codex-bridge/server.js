@@ -3,6 +3,7 @@ const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
@@ -80,7 +81,7 @@ app.post("/codex", async (req, res) => {
   if (!rawPrompt.trim()) {
     return res.status(400).json({ error: "Missing prompt" });
   }
-  const prompt = buildPrompt([{ role: "user", content: rawPrompt }]);
+  const prompt = buildPrompt([{ role: "user", content: rawPrompt }], req.body.tools);
 
   const workdir = resolveWorkdir(req.body);
   if (!workdir.ok) {
@@ -129,7 +130,7 @@ app.post("/codex", async (req, res) => {
 });
 
 app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
-  const { messages, stream } = req.body;
+  const { messages, stream, tools } = req.body;
   const wantsStream = stream === true;
   const model = req.body.model || "codex";
   const responseId = makeId("chatcmpl");
@@ -154,7 +155,7 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
     });
   }
 
-  const prompt = buildPrompt(messages);
+  const prompt = buildPrompt(messages, tools);
   if (!prompt.trim()) {
     return res.status(400).json({
       error: {
@@ -440,7 +441,7 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
 
     const cmd = formatCommand(item.command || "");
     commandStates.set(item.id, { outputLength: 0, blockOpen: true });
-    onDebug?.(`\n**>_** \`${cmd}\`\n\`\`\`text\n`);
+    onDebug?.(`\n> **>_** \`${cmd}\`\n> <details><summary>点击展开执行输出</summary>\n>\n> \`\`\`text\n> `);
     return;
   }
 
@@ -449,27 +450,20 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
   const state = commandStates.get(item.id) || { outputLength: 0, blockOpen: false };
 
   if (STREAM_COMMAND_OUTPUT && typeof item.aggregated_output === "string") {
-    const MAX_OUTPUT_LENGTH = 1000; // Limit command output in UI to prevent clutter
     const oldLength = state.outputLength || 0;
+    const nextOutput = item.aggregated_output.slice(oldLength);
     
-    if (oldLength < MAX_OUTPUT_LENGTH) {
-      let nextOutput = item.aggregated_output.slice(oldLength);
-      
-      if (oldLength + nextOutput.length > MAX_OUTPUT_LENGTH) {
-        nextOutput = nextOutput.slice(0, MAX_OUTPUT_LENGTH - oldLength) + "\n... [输出过长已自动截断，仅显示前部分] ...";
-      }
-      
-      if (nextOutput) onDebug?.(nextOutput);
+    if (nextOutput) {
+      onDebug?.(nextOutput.replace(/\n/g, '\n> '));
     }
     
-    // Always update length to track where we are, even if we stop outputting to UI
     state.outputLength = item.aggregated_output.length;
     commandStates.set(item.id, state);
   }
 
   if (event.type === "item.completed") {
     const exitCode = item.exit_code ?? "unknown";
-    const closeBlock = state.blockOpen ? "\n```\n" : "";
+    const closeBlock = state.blockOpen ? "\n> ```\n>\n> </details>\n\n" : "";
     const isSuccess = exitCode === 0 || exitCode === "0";
     
     const status = isSuccess ? "\n" : `> ❌ **执行失败 (Exit Code: ${exitCode})**\n\n`;
@@ -486,6 +480,14 @@ function formatCommand(command) {
   }
 
   return cmd.length > 120 ? `${cmd.substring(0, 117)}...` : cmd;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function startSse(res) {
@@ -541,7 +543,7 @@ function sendDone(res, id, model, created = Math.floor(Date.now() / 1000)) {
   res.end();
 }
 
-function buildPrompt(messages) {
+function buildPrompt(messages, tools = []) {
   const normalized = messages
     .map((message) => ({
       role: message.role || "user",
@@ -556,6 +558,19 @@ function buildPrompt(messages) {
   const skills = loadSkills();
   const matchedSkills = matchSkills(userIntent, skills);
   const skillPrompt = buildSkillsPrompt(skills, matchedSkills);
+
+  let clientToolsPrompt = "";
+  if (Array.isArray(tools) && tools.length > 0) {
+    clientToolsPrompt = `
+[Client Native Tools/Skills]
+The client environment (Work Buddy) has provided the following native tools (OpenAI format) that you can invoke. 
+You SHOULD proactively use these tools when they are relevant to the user's request.
+Because you are running through a text-based proxy, to invoke a tool, you should output a clear JSON function call block in your response, or follow whatever syntax the client usually expects for tool invocation.
+\`\`\`json
+${JSON.stringify(tools, null, 2)}
+\`\`\`
+`;
+  }
 
   // Load persistent agent memory if it exists
   let agentMemoryPrompt = "";
@@ -577,26 +592,27 @@ You are a highly capable AI Agent, an elite autonomous developer. You MUST use t
    - If a command fails, DO NOT immediately ask the user for help. Read the error, analyze it, and try at least 2 different approaches to fix it yourself before giving up.
    - You have permission to create, modify, and delete files to achieve the user's goal.
 
-2. ALWAYS-ONLINE RESEARCH FIRST:
-   - Before doing any task, first perform an internet search or online verification whenever web access is available, even if the user does not explicitly ask for it.
-   - Use online research to confirm current facts, package versions, APIs, docs, best practices, error messages, and implementation details before making decisions.
-   - If the task is purely about local files, still do a brief online check for relevant current context unless the user explicitly says not to browse.
-   - If web access fails or is unavailable, say so briefly, continue with local inspection, and do not fabricate search results.
-   - When online research affects the answer or implementation, mention the source or searched target concisely in the execution feedback.
+2. SEAMLESS ONLINE RESEARCH & CREATIVITY:
+   - Integrate online research seamlessly with your local analysis and creative problem-solving.
+   - Only perform internet searches when the task genuinely requires up-to-date facts, external APIs, specific documentation, or troubleshooting unknown errors.
+   - When you do use online research, you MUST explicitly list all the URLs you visited or referenced in a separate section using this exact format:
+**🌐 搜索来源**
+- [Title](URL)
+- [Title](URL)
 
-3. THINKING PROCESS (Chain of Thought): Always wrap your reasoning in this exact blockquote format before taking action:
-> **🤔 深度思考**
-> (1. Analyze the request... 2. Plan the steps... 3. Anticipate edge cases...)
+3. THINKING PROCESS (Chain of Thought): Always wrap your reasoning in this exact format before taking action:
+**🤔 深度思考**
+(1. Analyze the request... 2. Plan the steps... 3. Anticipate edge cases...)
 
 4. PROGRESS TRACKING: When updating task status, use this exact format:
-> **✅ 进度更新**
-> - [x] (Completed task)
-> - [ ] (Pending task)
+**✅ 进度更新**
+- [x] (Completed task)
+- [ ] (Pending task)
 
 5. FILE OPERATIONS: After you modify, create, or read a file, explicitly state the result using one of these formats:
-> 📄 \`filename.ext\` *(已修改)* **+n -m** (n = lines added, m = lines removed)
-> ❌ \`filename.ext\` *(修改失败)*
-> 👁️ \`filename.ext\` *(已读取)*
+📄 \`filename.ext\` *(已修改)* **+n -m** (n = lines added, m = lines removed)
+❌ \`filename.ext\` *(修改失败)*
+👁️ \`filename.ext\` *(已读取)*
 
 6. CONCISE CODE CHANGES: For large code modifications, DO NOT output the full file content in your conversation response. Instead, use a "SEARCH/REPLACE" style diff or a unified diff format to show only what changed. This makes it much easier for the user to review.
    Example:
@@ -605,19 +621,17 @@ You are a highly capable AI Agent, an elite autonomous developer. You MUST use t
    + (new code line)
    \`\`\`
 
-7. COLLAPSIBLE LONG TEXT OUTPUT:
-   - When showing extracted copy, OCR text, logs, generated articles, or any long plain-text result, do not display the full content expanded by default.
-   - Prefer a collapsed Markdown-compatible HTML block:
-     \`<details><summary>查看提取文案（预览：前 1-2 行）</summary>\n\n\`\`\`text\n(full content)\n\`\`\`\n\n</details>\`
-   - If the client does not support \`details/summary\`, show only a short preview first and provide the full content only when the user asks to expand it.
-   - Keep the default view compact so the chat remains easy to scan.
+7. AVOID MASSIVE TEXT OUTPUTS:
+   - NEVER output massive raw arrays, JSON data, long file contents, or unformatted data dumps directly into the chat response.
+   - If you extract or process a large amount of data, DO NOT print it all. Instead, print a short preview (e.g., first 2-3 items) and summarize the rest, or save the full result to a local file and provide the user with the file path.
+   - Do not use HTML <details> tags for massive data as it may break the UI. Simply truncate the output and tell the user it has been truncated or saved.
 
 8. NATURAL LANGUAGE: Explain what you are about to do in normal text before running commands.
 
 9. ENCODING: Avoid Chinese text mojibake. When creating or modifying scripts, source files, JSON, Markdown, batch files, or PowerShell files that contain Chinese text, save them as UTF-8. On Windows, prefer explicit encoding flags such as PowerShell \`-Encoding utf8\`, Node.js \`fs.writeFileSync(path, content, "utf8")\`, and Python \`open(path, "w", encoding="utf-8")\`. Before running PowerShell commands that print Chinese text, set \`$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\`.
 
-Rule: Always respond in Chinese. Strictly maintain these Markdown prefixes (>, 📄, ✅, etc.) so the frontend can render them beautifully. Use concise diffs for large changes.
-${agentMemoryPrompt}${skillPrompt}`;
+Rule: Always respond in Chinese. Strictly maintain these Markdown prefixes (📄, ✅, etc.) so the frontend can render them beautifully. Use concise diffs for large changes.
+${agentMemoryPrompt}${skillPrompt}${clientToolsPrompt}`;
 
   if (normalized.length === 1 && normalized[0].role === "user") {
     return `${systemPrompt}\n\nUSER:\n${normalized[0].content}`;
@@ -632,18 +646,31 @@ ${agentMemoryPrompt}${skillPrompt}`;
 }
 
 function loadSkills() {
-  if (!fs.existsSync(SKILLS_DIR)) return [];
+  const dirsToScan = [
+    SKILLS_DIR,
+    path.join(os.homedir(), ".workbuddy", "skills-marketplace", "skills"),
+  ];
 
-  return fs
-    .readdirSync(SKILLS_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => {
-      const filePath = path.join(SKILLS_DIR, entry.name, "SKILL.md");
-      if (!fs.existsSync(filePath)) return null;
-      const content = fs.readFileSync(filePath, "utf8");
-      return parseSkill(entry.name, filePath, content);
-    })
-    .filter(Boolean);
+  const allSkills = [];
+
+  for (const dir of dirsToScan) {
+    if (!fs.existsSync(dir)) continue;
+
+    const entries = fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const filePath = path.join(dir, entry.name, "SKILL.md");
+        if (!fs.existsSync(filePath)) return null;
+        const content = fs.readFileSync(filePath, "utf8");
+        return parseSkill(entry.name, filePath, content);
+      })
+      .filter(Boolean);
+
+    allSkills.push(...entries);
+  }
+
+  return allSkills;
 }
 
 function parseSkill(directoryName, filePath, content) {
@@ -695,7 +722,7 @@ function buildSkillsPrompt(skills, matchedSkills) {
     return `
 
 ## Skills
-No local skills were found. Local skills can be added under: ${SKILLS_DIR}`;
+No local skills were found. Local skills can be added under: ${SKILLS_DIR} or ~/.workbuddy/skills-marketplace/skills`;
   }
 
   const index = skills
