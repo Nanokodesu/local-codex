@@ -14,6 +14,13 @@ const STREAM_CODEX_EVENTS = process.env.CODEX_STREAM_EVENTS !== "false";
 const STREAM_COMMAND_OUTPUT = process.env.CODEX_STREAM_COMMAND_OUTPUT !== "false";
 const SKILLS_DIR = process.env.CODEX_SKILLS_DIR || path.join(process.cwd(), "skills");
 const MAX_MATCHED_SKILLS = Number(process.env.CODEX_MAX_MATCHED_SKILLS || 3);
+const UTF8_ENV = {
+  LANG: process.env.LANG || "C.UTF-8",
+  LC_ALL: process.env.LC_ALL || "C.UTF-8",
+  PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
+  PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+  npm_config_unicode: process.env.npm_config_unicode || "true",
+};
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
@@ -273,7 +280,6 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
 
     console.log(`[codex] ${CODEX_BIN} ${args.join(" ")} (cwd: ${cwd})`);
 
-    // 鏋勫缓涓€涓函鍑€鐨勬墽琛岀幆澧冨彉閲忥紝鍙繚鐣欏繀瑕佺殑 PATH 鍜屼唬鐞?
     const cleanEnv = {
       PATH: process.env.PATH,
       HTTP_PROXY: process.env.HTTP_PROXY || "http://127.0.0.1:7897",
@@ -286,8 +292,8 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
 
     const child = spawn(CODEX_BIN, args, {
       cwd,
-      shell: process.platform === "win32", // 蹇呴』鎭㈠涓?true (鍦?Windows 涓?锛屽惁鍒欎細鎶?ENOENT 鎵句笉鍒板懡浠?
-      env: Object.assign({}, process.env, cleanEnv, { NO_COLOR: "1" }),
+      shell: process.platform === "win32",
+      env: Object.assign({}, process.env, cleanEnv, UTF8_ENV, { NO_COLOR: "1" }),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -404,7 +410,6 @@ function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, command
   const item = event.item;
   if (!item) return;
 
-  // 处理 AI 的回复消息（实现流式实时显示）
   if (item.type === "agent_message") {
     const state = commandStates.get(item.id) || { lastLength: 0 };
     const fullText = normalizeContent(item.text || item.content || "");
@@ -423,7 +428,6 @@ function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, command
     return;
   }
 
-  // 处理命令执行（实现终端输出实时显示）
   if (item.type === "command_execution") {
     handleCommandEvent(event, item, { onDebug, onProgress, commandStates, progressState });
     return;
@@ -436,7 +440,6 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
 
     const cmd = formatCommand(item.command || "");
     commandStates.set(item.id, { outputLength: 0, blockOpen: true });
-    // 采用类似 Trae 的命令头格式
     onDebug?.(`\n**>_** \`${cmd}\`\n\`\`\`text\n`);
     return;
   }
@@ -446,11 +449,22 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
   const state = commandStates.get(item.id) || { outputLength: 0, blockOpen: false };
 
   if (STREAM_COMMAND_OUTPUT && typeof item.aggregated_output === "string") {
+    const MAX_OUTPUT_LENGTH = 1000; // Limit command output in UI to prevent clutter
     const oldLength = state.outputLength || 0;
-    const nextOutput = item.aggregated_output.slice(oldLength);
+    
+    if (oldLength < MAX_OUTPUT_LENGTH) {
+      let nextOutput = item.aggregated_output.slice(oldLength);
+      
+      if (oldLength + nextOutput.length > MAX_OUTPUT_LENGTH) {
+        nextOutput = nextOutput.slice(0, MAX_OUTPUT_LENGTH - oldLength) + "\n... [输出过长已自动截断，仅显示前部分] ...";
+      }
+      
+      if (nextOutput) onDebug?.(nextOutput);
+    }
+    
+    // Always update length to track where we are, even if we stop outputting to UI
     state.outputLength = item.aggregated_output.length;
     commandStates.set(item.id, state);
-    if (nextOutput) onDebug?.(nextOutput);
   }
 
   if (event.type === "item.completed") {
@@ -458,7 +472,6 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
     const closeBlock = state.blockOpen ? "\n```\n" : "";
     const isSuccess = exitCode === 0 || exitCode === "0";
     
-    // 成功时不显示状态码，保持简洁；失败时显示错误标识
     const status = isSuccess ? "\n" : `> ❌ **执行失败 (Exit Code: ${exitCode})**\n\n`;
     onDebug?.(`${closeBlock}${status}`);
     commandStates.delete(item.id);
@@ -544,27 +557,67 @@ function buildPrompt(messages) {
   const matchedSkills = matchSkills(userIntent, skills);
   const skillPrompt = buildSkillsPrompt(skills, matchedSkills);
 
+  // Load persistent agent memory if it exists
+  let agentMemoryPrompt = "";
+  const memoryPath = path.join(process.cwd(), ".agent_memory.json");
+  if (fs.existsSync(memoryPath)) {
+    try {
+      const memoryData = fs.readFileSync(memoryPath, "utf8");
+      agentMemoryPrompt = `\n[Agent Persistent Memory]\nHere is your remembered context from previous sessions:\n\`\`\`json\n${memoryData}\n\`\`\`\nUse this memory to maintain context and avoid repeating mistakes or asking for the same information twice.\n`;
+    } catch (err) {
+      console.error("[Codex Bridge] Failed to read agent memory:", err.message);
+    }
+  }
+
   const systemPrompt = `[System Instructions]
-You are a highly capable AI Agent. You MUST use the following specific Markdown structures to simulate a native Agent UI experience for the user.
+You are a highly capable AI Agent, an elite autonomous developer. You MUST use the following specific Markdown structures to simulate a native Agent UI experience for the user.
 
-1. THINKING PROCESS: Always wrap your reasoning in this exact blockquote format:
+1. AUTONOMY & SELF-CORRECTION (Agent Protocol):
+   - You are proactive. Do not stop at partial fixes. Carry changes through implementation, testing, and refinement without waiting for the user.
+   - If a command fails, DO NOT immediately ask the user for help. Read the error, analyze it, and try at least 2 different approaches to fix it yourself before giving up.
+   - You have permission to create, modify, and delete files to achieve the user's goal.
+
+2. ALWAYS-ONLINE RESEARCH FIRST:
+   - Before doing any task, first perform an internet search or online verification whenever web access is available, even if the user does not explicitly ask for it.
+   - Use online research to confirm current facts, package versions, APIs, docs, best practices, error messages, and implementation details before making decisions.
+   - If the task is purely about local files, still do a brief online check for relevant current context unless the user explicitly says not to browse.
+   - If web access fails or is unavailable, say so briefly, continue with local inspection, and do not fabricate search results.
+   - When online research affects the answer or implementation, mention the source or searched target concisely in the execution feedback.
+
+3. THINKING PROCESS (Chain of Thought): Always wrap your reasoning in this exact blockquote format before taking action:
 > **🤔 深度思考**
-> (Write your analysis, plan, or thoughts here...)
+> (1. Analyze the request... 2. Plan the steps... 3. Anticipate edge cases...)
 
-2. PROGRESS TRACKING: When updating task status, use this exact format:
+4. PROGRESS TRACKING: When updating task status, use this exact format:
 > **✅ 进度更新**
 > - [x] (Completed task)
 > - [ ] (Pending task)
 
-3. FILE OPERATIONS: After you modify, create, or read a file, explicitly state the result using one of these formats:
-> 📄 \`filename.ext\` *(已修改)*
+5. FILE OPERATIONS: After you modify, create, or read a file, explicitly state the result using one of these formats:
+> 📄 \`filename.ext\` *(已修改)* **+n -m** (n = lines added, m = lines removed)
 > ❌ \`filename.ext\` *(修改失败)*
 > 👁️ \`filename.ext\` *(已读取)*
 
-4. NATURAL LANGUAGE: Explain what you are about to do in normal text before running commands.
+6. CONCISE CODE CHANGES: For large code modifications, DO NOT output the full file content in your conversation response. Instead, use a "SEARCH/REPLACE" style diff or a unified diff format to show only what changed. This makes it much easier for the user to review.
+   Example:
+   \`\`\`diff
+   - (old code line)
+   + (new code line)
+   \`\`\`
 
-Rule: Always respond in Chinese. Strictly maintain these Markdown prefixes (>, 📄, ✅, etc.) so the frontend can render them beautifully.
-${skillPrompt}`;
+7. COLLAPSIBLE LONG TEXT OUTPUT:
+   - When showing extracted copy, OCR text, logs, generated articles, or any long plain-text result, do not display the full content expanded by default.
+   - Prefer a collapsed Markdown-compatible HTML block:
+     \`<details><summary>查看提取文案（预览：前 1-2 行）</summary>\n\n\`\`\`text\n(full content)\n\`\`\`\n\n</details>\`
+   - If the client does not support \`details/summary\`, show only a short preview first and provide the full content only when the user asks to expand it.
+   - Keep the default view compact so the chat remains easy to scan.
+
+8. NATURAL LANGUAGE: Explain what you are about to do in normal text before running commands.
+
+9. ENCODING: Avoid Chinese text mojibake. When creating or modifying scripts, source files, JSON, Markdown, batch files, or PowerShell files that contain Chinese text, save them as UTF-8. On Windows, prefer explicit encoding flags such as PowerShell \`-Encoding utf8\`, Node.js \`fs.writeFileSync(path, content, "utf8")\`, and Python \`open(path, "w", encoding="utf-8")\`. Before running PowerShell commands that print Chinese text, set \`$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\`.
+
+Rule: Always respond in Chinese. Strictly maintain these Markdown prefixes (>, 📄, ✅, etc.) so the frontend can render them beautifully. Use concise diffs for large changes.
+${agentMemoryPrompt}${skillPrompt}`;
 
   if (normalized.length === 1 && normalized[0].role === "user") {
     return `${systemPrompt}\n\nUSER:\n${normalized[0].content}`;
