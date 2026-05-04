@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Codex Bridge Server
 color 0A
 

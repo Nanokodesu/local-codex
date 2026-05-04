@@ -1,4 +1,4 @@
-﻿const express = require("express");
+﻿﻿const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -12,18 +12,35 @@ const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const CODEX_MODEL = process.env.CODEX_MODEL || "";
 const STREAM_PROGRESS = process.env.CODEX_STREAM_PROGRESS !== "false";
 const STREAM_CODEX_EVENTS = process.env.CODEX_STREAM_EVENTS !== "false";
-const STREAM_COMMAND_OUTPUT = process.env.CODEX_STREAM_COMMAND_OUTPUT !== "false";
+const STREAM_COMMAND_OUTPUT = process.env.CODEX_STREAM_COMMAND_OUTPUT === "true";
+const TERMINAL_COMMAND_OUTPUT_PREVIEW = Number(process.env.CODEX_TERMINAL_COMMAND_OUTPUT_PREVIEW || 2000);
 const SKILLS_DIR = process.env.CODEX_SKILLS_DIR || path.join(process.cwd(), "skills");
 const MAX_MATCHED_SKILLS = Number(process.env.CODEX_MAX_MATCHED_SKILLS || 3);
+const ATTACHMENTS_DIR = process.env.CODEX_ATTACHMENTS_DIR || path.join(os.tmpdir(), "codex-bridge-attachments");
+const OBSIDIAN_VAULT = "e:/321/nano";
+
 const UTF8_ENV = {
   LANG: process.env.LANG || "C.UTF-8",
   LC_ALL: process.env.LC_ALL || "C.UTF-8",
   PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
   PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+  LESSCHARSET: process.env.LESSCHARSET || "utf-8",
   npm_config_unicode: process.env.npm_config_unicode || "true",
 };
+const WINDOWS_UTF8_ENV = process.platform === "win32" ? {
+  DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION: process.env.DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION || "1",
+  POWERSHELL_TELEMETRY_OPTOUT: process.env.POWERSHELL_TELEMETRY_OPTOUT || "1",
+  PYTHONLEGACYWINDOWSSTDIO: process.env.PYTHONLEGACYWINDOWSSTDIO || "0",
+} : {};
+
+process.stdout.setDefaultEncoding?.("utf8");
+process.stderr.setDefaultEncoding?.("utf8");
 
 app.use(cors());
+app.use((req, res, next) => {
+  res.charset = "utf-8";
+  next();
+});
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -38,6 +55,7 @@ const MODELS = [
   "gpt-5.1-codex",
   "gpt-4.1",
   "gpt-4o",
+  "gpt-5.5",
 ];
 
 app.get([/^\/.*models$/], (req, res) => {
@@ -77,7 +95,13 @@ app.get(["/", "/health"], (req, res) => {
 });
 
 app.post("/codex", async (req, res) => {
-  const rawPrompt = normalizeContent(req.body.prompt);
+  const rawPrompt = normalizeMessageContent({
+    content: req.body.prompt,
+    attachments: req.body.attachments,
+    files: req.body.files,
+    images: req.body.images,
+    items: req.body.items,
+  });
   if (!rawPrompt.trim()) {
     return res.status(400).json({ error: "Missing prompt" });
   }
@@ -91,6 +115,9 @@ app.post("/codex", async (req, res) => {
   const wantsStream = req.body.stream === true;
   const responseId = makeId("codex");
   const model = req.body.model || "codex";
+  const progressId = makeId("progress");
+  const progressSteps = [];
+  let hasSentProgressHeader = false;
 
   if (wantsStream) {
     startSse(res);
@@ -100,6 +127,7 @@ app.post("/codex", async (req, res) => {
   try {
     await runCodex({
       prompt,
+      model,
       cwd: workdir.path,
       onText: (text, options = {}) => {
         if (options.includeInFinal !== false) output += text;
@@ -109,7 +137,19 @@ app.post("/codex", async (req, res) => {
         if (wantsStream && STREAM_CODEX_EVENTS) sendChatChunk(res, responseId, model, text);
       },
       onProgress: (text) => {
-        if (wantsStream && STREAM_PROGRESS) sendChatChunk(res, responseId, model, text);
+        if (wantsStream && STREAM_PROGRESS) {
+          const clean = text.replace(/\*\*✅ 进度更新\*\*/g, "").replace(/^- \[[ x]\] /g, "").replace(/，详细过程见服务端终端。?/, "").trim();
+          if (clean && !progressSteps.includes(clean)) {
+            progressSteps.push(clean);
+            let delta = "";
+            if (!hasSentProgressHeader) {
+              delta += `\n\n**✅ 进度更新**\n`;
+              hasSentProgressHeader = true;
+            }
+            delta += `- [x] ${clean}\n`;
+            sendChatChunk(res, progressId, model, delta);
+          }
+        }
       },
       signalClose: res,
     });
@@ -155,7 +195,7 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
     });
   }
 
-  const prompt = buildPrompt(messages, tools);
+  const prompt = buildPrompt(mergeRequestAttachments(messages, req.body), tools);
   if (!prompt.trim()) {
     return res.status(400).json({
       error: {
@@ -164,6 +204,10 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
       },
     });
   }
+
+  const progressId = makeId("progress");
+  const progressSteps = [];
+  let hasSentProgressHeader = false;
 
   if (wantsStream) {
     startSse(res);
@@ -175,6 +219,7 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
   try {
     await runCodex({
       prompt,
+      model,
       cwd: workdir.path,
       onUsage: (nextUsage) => {
         usage = nextUsage;
@@ -187,7 +232,19 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
         if (wantsStream && STREAM_CODEX_EVENTS) sendChatChunk(res, responseId, model, text, created);
       },
       onProgress: (text) => {
-        if (wantsStream && STREAM_PROGRESS) sendChatChunk(res, responseId, model, text, created);
+        if (wantsStream && STREAM_PROGRESS) {
+          const clean = text.replace(/\*\*✅ 进度更新\*\*/g, "").replace(/^- \[[ x]\] /g, "").replace(/，详细过程见服务端终端。?/, "").trim();
+          if (clean && !progressSteps.includes(clean)) {
+            progressSteps.push(clean);
+            let delta = "";
+            if (!hasSentProgressHeader) {
+              delta += `\n\n**✅ 进度更新**\n`;
+              hasSentProgressHeader = true;
+            }
+            delta += `- [x] ${clean}\n`;
+            sendChatChunk(res, progressId, model, delta, created);
+          }
+        }
       },
       signalClose: res,
     });
@@ -261,7 +318,7 @@ const server = app.listen(PORT, () => {
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 
-function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClose }) {
+function runCodex({ prompt, model, cwd, onText, onDebug, onProgress, onUsage, signalClose }) {
   return new Promise((resolve, reject) => {
     const args = [
       "exec",
@@ -273,8 +330,9 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
       "--dangerously-bypass-approvals-and-sandbox",
     ];
 
-    if (CODEX_MODEL) {
-      args.push("-m", CODEX_MODEL);
+    const targetModel = model || CODEX_MODEL;
+    if (targetModel) {
+      args.push("-m", targetModel);
     }
 
     args.push("-");
@@ -294,7 +352,7 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
     const child = spawn(CODEX_BIN, args, {
       cwd,
       shell: process.platform === "win32",
-      env: Object.assign({}, process.env, cleanEnv, UTF8_ENV, { NO_COLOR: "1" }),
+      env: Object.assign({}, process.env, cleanEnv, UTF8_ENV, WINDOWS_UTF8_ENV, { NO_COLOR: "1" }),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -302,10 +360,6 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
     let stderrBuffer = "";
     let settled = false;
     const commandStates = new Map();
-    const progressState = {
-      commandStarted: false,
-      finalStarted: false,
-    };
 
     const finish = (fn, value) => {
       if (settled) return;
@@ -352,7 +406,6 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
           onProgress,
           onUsage,
           commandStates,
-          progressState,
         });
       });
     });
@@ -381,7 +434,6 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
             onProgress,
             onUsage,
             commandStates,
-            progressState,
           });
         } catch {
           console.log(`[codex stdout tail] ${stdoutBuffer.trim()}`);
@@ -402,7 +454,7 @@ function runCodex({ prompt, cwd, onText, onDebug, onProgress, onUsage, signalClo
   });
 }
 
-function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, commandStates, progressState }) {
+function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, commandStates }) {
   if (event.type === "turn.completed") {
     onUsage?.(event.usage);
     return;
@@ -430,31 +482,51 @@ function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, command
   }
 
   if (item.type === "command_execution") {
-    handleCommandEvent(event, item, { onDebug, onProgress, commandStates, progressState });
+    handleCommandEvent(event, item, { onProgress, commandStates });
     return;
   }
 }
 
-function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, progressState }) {
+function handleCommandEvent(event, item, { onProgress, commandStates }) {
   if (event.type === "item.started") {
     if (!STREAM_CODEX_EVENTS) return;
 
     const cmd = formatCommand(item.command || "");
-    commandStates.set(item.id, { outputLength: 0, blockOpen: true });
-    onDebug?.(`\n> **>_** \`${cmd}\`\n> <details><summary>点击展开执行输出</summary>\n>\n> \`\`\`text\n> `);
+    const summary = summarizeCommand(cmd);
+    commandStates.set(item.id, { 
+      outputLength: 0, 
+      command: cmd,
+      summary,
+      truncated: false,
+      displayedLength: 0 
+    });
+    console.log(`[codex command] started: ${cmd}`);
+    onProgress?.(`${summary}`);
     return;
   }
 
   if (!STREAM_CODEX_EVENTS) return;
 
-  const state = commandStates.get(item.id) || { outputLength: 0, blockOpen: false };
+  const state = commandStates.get(item.id) || { outputLength: 0, command: "", summary: "正在执行本地命令", truncated: false, displayedLength: 0 };
 
-  if (STREAM_COMMAND_OUTPUT && typeof item.aggregated_output === "string") {
+  if (STREAM_COMMAND_OUTPUT && typeof item.aggregated_output === "string" && !state.truncated) {
     const oldLength = state.outputLength || 0;
     const nextOutput = item.aggregated_output.slice(oldLength);
     
     if (nextOutput) {
-      onDebug?.(nextOutput.replace(/\n/g, '\n> '));
+      if (state.displayedLength + nextOutput.length > TERMINAL_COMMAND_OUTPUT_PREVIEW) {
+        const allowed = TERMINAL_COMMAND_OUTPUT_PREVIEW - state.displayedLength;
+        if (allowed > 0) {
+          const part = nextOutput.slice(0, allowed);
+          console.log(`[codex command output] ${stripAnsi(part)}`);
+          state.displayedLength += part.length;
+        }
+        console.log("[codex command output] ... truncated; full output remains in Codex event stream ...");
+        state.truncated = true;
+      } else {
+        console.log(`[codex command output] ${stripAnsi(nextOutput)}`);
+        state.displayedLength += nextOutput.length;
+      }
     }
     
     state.outputLength = item.aggregated_output.length;
@@ -463,11 +535,10 @@ function handleCommandEvent(event, item, { onDebug, onProgress, commandStates, p
 
   if (event.type === "item.completed") {
     const exitCode = item.exit_code ?? "unknown";
-    const closeBlock = state.blockOpen ? "\n> ```\n>\n> </details>\n\n" : "";
     const isSuccess = exitCode === 0 || exitCode === "0";
-    
-    const status = isSuccess ? "\n" : `> ❌ **执行失败 (Exit Code: ${exitCode})**\n\n`;
-    onDebug?.(`${closeBlock}${status}`);
+    const status = isSuccess ? `${state.summary || "本地命令"}已完成` : `${state.summary || "本地命令"}失败，退出码：${exitCode}`;
+    console.log(`[codex command] completed (${exitCode}): ${state.command || formatCommand(item.command || "")}`);
+    onProgress?.(`${status}`);
     commandStates.delete(item.id);
   }
 }
@@ -482,12 +553,19 @@ function formatCommand(command) {
   return cmd.length > 120 ? `${cmd.substring(0, 117)}...` : cmd;
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function summarizeCommand(command) {
+  const cmd = String(command || "").toLowerCase();
+
+  if (cmd.includes("apply_patch")) return "正在修改项目文件";
+  if (cmd.includes("node -c") || cmd.includes("npm run typecheck") || cmd.includes("tsc")) return "正在检查代码语法或类型";
+  if (cmd.includes("npm test") || cmd.includes("pytest") || cmd.includes("vitest") || cmd.includes("jest")) return "正在运行测试";
+  if (cmd.includes("npm run build") || cmd.includes("vite build") || cmd.includes("next build")) return "正在构建项目";
+  if (cmd.includes("rg ") || cmd.includes("select-string") || cmd.includes("findstr")) return "正在搜索代码";
+  if (cmd.includes("get-content") || cmd.includes("type ") || cmd.includes("cat ")) return "正在读取文件内容";
+  if (cmd.includes("git diff") || cmd.includes("git status")) return "正在检查代码变更";
+  if (cmd.includes("get-childitem") || cmd.includes(" ls ") || cmd.startsWith("ls ")) return "正在查看项目文件";
+
+  return "正在执行本地命令";
 }
 
 function startSse(res) {
@@ -547,7 +625,7 @@ function buildPrompt(messages, tools = []) {
   const normalized = messages
     .map((message) => ({
       role: message.role || "user",
-      content: normalizeContent(message.content),
+      content: normalizeMessageContent(message),
     }))
     .filter((message) => message.content.trim());
 
@@ -577,7 +655,16 @@ ${JSON.stringify(tools, null, 2)}
   const memoryPath = path.join(process.cwd(), ".agent_memory.json");
   if (fs.existsSync(memoryPath)) {
     try {
-      const memoryData = fs.readFileSync(memoryPath, "utf8");
+      const buffer = fs.readFileSync(memoryPath);
+      let memoryData;
+      try {
+        const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+        memoryData = utf8Decoder.decode(buffer);
+      } catch (e) {
+        const gbkDecoder = new TextDecoder("gbk");
+        memoryData = gbkDecoder.decode(buffer);
+      }
+      JSON.parse(memoryData);
       agentMemoryPrompt = `\n[Agent Persistent Memory]\nHere is your remembered context from previous sessions:\n\`\`\`json\n${memoryData}\n\`\`\`\nUse this memory to maintain context and avoid repeating mistakes or asking for the same information twice.\n`;
     } catch (err) {
       console.error("[Codex Bridge] Failed to read agent memory:", err.message);
@@ -585,34 +672,43 @@ ${JSON.stringify(tools, null, 2)}
   }
 
   const systemPrompt = `[System Instructions]
-You are a highly capable AI Agent, an elite autonomous developer. You MUST use the following specific Markdown structures to simulate a native Agent UI experience for the user.
+You are a HIGHLY AUTONOMOUS ELITE DEVELOPER. You don't just follow instructions; you solve problems with extreme technical depth and creativity.
 
-1. AUTONOMY & SELF-CORRECTION (Agent Protocol):
-   - You are proactive. Do not stop at partial fixes. Carry changes through implementation, testing, and refinement without waiting for the user.
-   - If a command fails, DO NOT immediately ask the user for help. Read the error, analyze it, and try at least 2 different approaches to fix it yourself before giving up.
-   - You have permission to create, modify, and delete files to achieve the user's goal.
+1. INTELLIGENCE-DRIVEN PROTOCOL (CRITICAL):
+   - **Vault Definition**: When you refer to "仓库" (Vault) or repository in a general context, it refers to your Obsidian Vault located at \`e:/321/nano\`. The project path (\`e:/local codex/codex-bridge\`) is ONLY for system bridge files.
+   - **Mandatory Investigation**: Before forming any plan or implementation, you MUST proactively gather intelligence. Use local search/read tools to understand the codebase AND web search to check documentation, best practices, or external context.
+   - **Intelligence-First Planning**: Your "📋 任务规划" must be derived from actual findings in the local files and online research. Avoid guessing.
+   - **Extreme Autonomy**: If a task is ambiguous, investigate the local context and technical docs to deduce the most reasonable path forward. Propose and implement elegant, modern, and high-performance solutions.
 
 2. SEAMLESS ONLINE RESEARCH & CREATIVITY:
-   - Integrate online research seamlessly with your local analysis and creative problem-solving.
-   - Only perform internet searches when the task genuinely requires up-to-date facts, external APIs, specific documentation, or troubleshooting unknown errors.
-   - When you do use online research, you MUST explicitly list all the URLs you visited or referenced in a separate section using this exact format:
+   - Integrate online research seamlessly with your local analysis. 
+   - Default to doing a brief online check before answering or implementing, especially when facts, APIs, documentation, versions, or best practices might be relevant.
+   - When you do use online research, you MUST explicitly list all the URLs you visited or referenced:
 **🌐 搜索来源**
 - [Title](URL)
 - [Title](URL)
 
-3. THINKING PROCESS (Chain of Thought): Always wrap your reasoning in this exact format before taking action:
+3. THINKING PROCESS (Chain of Thought):
 **🤔 深度思考**
-(1. Analyze the request... 2. Plan the steps... 3. Anticipate edge cases...)
+(1. Investigation Phase: What do I need to search locally/online to fully understand the context? 2. Analysis: What are the core findings and potential risks? 3. Creative Design: What is the most robust and elegant solution? 4. Verification Plan: How will I prove it works?)
 
-4. PROGRESS TRACKING: When updating task status, use this exact format:
-**✅ 进度更新**
-- [x] (Completed task)
-- [ ] (Pending task)
+4. PLANNING & PROGRESS:
+   - At the VERY START of your response (immediately after Thinking), provide your intelligence-driven task list:
+**📋 任务规划**
+- [ ] (Investigation task)
+- [ ] (Implementation task)
+- [ ] (Verification/Testing task)
+   - During your response, provide status updates in NATURAL LANGUAGE only. 
+   - DO NOT output the "✅ 进度更新" block yourself; the system will handle the real-time progress bar at the top of the message.
+   - At the VERY END of your response, after all work is done, provide a final summary:
+**✅ 任务完成总结**
+- [x] (Completed Task 1)
+- [x] (Completed Task 2)
 
 5. FILE OPERATIONS: After you modify, create, or read a file, explicitly state the result using one of these formats:
-📄 \`filename.ext\` *(已修改)* **+n -m** (n = lines added, m = lines removed)
+📄 \`filename.ext\` *(已创建/已修改)* **+n -m** (n = lines added, m = lines removed)
 ❌ \`filename.ext\` *(修改失败)*
-👁️ \`filename.ext\` *(已读取)*
+📖 \`filename.ext\` *(已读取)*
 
 6. CONCISE CODE CHANGES: For large code modifications, DO NOT output the full file content in your conversation response. Instead, use a "SEARCH/REPLACE" style diff or a unified diff format to show only what changed. This makes it much easier for the user to review.
    Example:
@@ -623,25 +719,57 @@ You are a highly capable AI Agent, an elite autonomous developer. You MUST use t
 
 7. AVOID MASSIVE TEXT OUTPUTS (CRITICAL RULE):
    - YOU MUST NEVER regurgitate, repeat, or copy-paste large blocks of text, file contents, grep results, or code into your conversational response.
-   - If you search for files or read files, DO NOT print the contents you found in the chat. The user can already see the command output in the collapsed terminal block.
+   - **SMART TRUNCATION AWARENESS**: The terminal output bridge has a strict 2000-character display limit. If you run commands with huge output (e.g., \`cat\` a large file, \`npm install\`), the UI will truncate it. 
+   - **PREFER SPECIFIC COMMANDS**: ALWAYS use specific commands to find information rather than dumping whole files. Use \`grep -C 5\`, \`head -n 50\`, \`tail -n 50\`, or \`sed\` to extract only the necessary lines.
+   - If you search for files or read files, DO NOT print the contents you found in the chat. The user can already see the command output in the terminal block.
    - Instead of dumping text, provide a HIGH-LEVEL SUMMARY of what you found, or point the user to the file paths.
    - If you must show code, ONLY show the specific 2-3 lines that need changing using a diff format.
-   - If you need to output more than 10 lines of text, you MUST wrap it in a scrollable Markdown block using HTML like this:
-     <div style="max-height: 300px; overflow-y: auto; background-color: #f6f8fa; padding: 10px; border-radius: 6px;">
-       YOUR LONG TEXT HERE
-     </div>
+   - The UI DOES NOT support scrollable or collapsible blocks. YOU MUST keep your text output extremely concise.
    - VIOLATION OF THIS RULE WILL BREAK THE UI.
 
 8. PROACTIVE DOCUMENTATION (MARKDOWN ARTIFACTS):
-   - Like other native Work Buddy models, you MUST strongly prefer creating a Markdown (\`.md\`) file to present your final results, plans, summaries, or analyses, rather than outputting them entirely in the chat conversation.
-   - When asked to analyze, plan, summarize, design, or provide a comprehensive report, ALWAYS create a new \`.md\` file in the workspace containing your detailed findings, and simply link to or briefly mention that file in your chat response.
-   - This keeps the chat interface clean while providing the user with a tangible, persistent artifact.
+    - Like other native Work Buddy models, you MUST strongly prefer creating a Markdown (\`.md\`) file to present your final results, plans, summaries, or analyses, rather than outputting them entirely in the chat conversation.
+    - When asked to analyze, plan, summarize, design, or provide a comprehensive report, ALWAYS create a new \`.md\` file in the workspace containing your detailed findings.
+    - In your chat response, link to the file and provide a **CONCISE HIGH-LEVEL SUMMARY** (2-3 sentences) of the core conclusions or key takeaways at the end.
+    - This keeps the chat interface clean while providing the user with a tangible, persistent artifact and immediate context.
 
 9. NATURAL LANGUAGE: Explain what you are about to do in normal text before running commands.
 
-10. ENCODING: Avoid Chinese text mojibake. When creating or modifying scripts, source files, JSON, Markdown, batch files, or PowerShell files that contain Chinese text, save them as UTF-8. On Windows, prefer explicit encoding flags such as PowerShell \`-Encoding utf8\`, Node.js \`fs.writeFileSync(path, content, "utf8")\`, and Python \`open(path, "w", encoding="utf-8")\`. Before running PowerShell commands that print Chinese text, set \`$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\`.
+10. CHANGE SCOPE CONTROL:
+   - Treat the user's described problem as the boundary for code changes.
+   - Make the smallest coherent change that solves the requested problem, following existing project patterns.
+   - Do not opportunistically refactor, rename, reformat, reorganize, or "clean up" nearby code unless it is required for the requested fix.
+   - If a broader cleanup or adjacent fix would be useful, list it in the final response as a recommendation and wait for explicit approval.
+   - When editing shared files, preserve unrelated existing changes and avoid touching unrelated sections.
 
-Rule: Always respond in Chinese. Strictly maintain these Markdown prefixes (📄, ✅, etc.) so the frontend can render them beautifully. Use concise diffs for large changes.
+11. COMMAND VISIBILITY:
+   - In the chat UI, describe ongoing actions in natural language only.
+   - Keep exact commands, raw terminal output, stack traces, install logs, grep output, and long diagnostics in the terminal/tool output instead of repeating them in chat.
+   - When a command matters, summarize its purpose and result; do not paste the command transcript.
+
+12. WORK BUDDY ATTACHMENTS:
+   - User-supplied images, files, local paths, URLs, mentions, and other structured input items may be normalized into the conversation as compact attachment lines.
+   - When an attachment line contains a local path, use that path directly with local inspection tools instead of asking the user to upload it again.
+   - When an attachment line says a data URL was saved, inspect the saved local file path.
+   - Do not paste full file contents or binary data into chat; summarize what you inspected and cite the path.
+
+13. FINAL SUMMARY:
+   - You MUST NOT end any final response without a concise end-of-answer summary section titled "**✅ 任务完成总结**".
+   - Summarize meaningful actions completed, files changed or inspected, decisions made, and verification results.
+   - If you modified files, explicitly list each changed file with the same file-operation format from Rule 5.
+   - If you did not modify files, explicitly say "未修改文件".
+   - Keep this final summary short and high-signal.
+
+14. ENCODING: Avoid Chinese text mojibake. When creating, modifying, reading, or printing scripts, source files, JSON, Markdown, batch files, or PowerShell files that contain Chinese text, use UTF-8 explicitly. On Windows PowerShell, prefix commands that may read or print Chinese with \$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(\$false); chcp 65001 | Out-Null;. Use explicit flags such as PowerShell \`Get-Content -Encoding utf8\`, \`Set-Content -Encoding utf8\`, \`Out-File -Encoding utf8\`, Node.js \`fs.readFileSync(path, "utf8")\` / \`fs.writeFileSync(path, content, "utf8")\`, and Python \`open(path, encoding="utf-8")\` / \`open(path, "w", encoding="utf-8")\`. Do not rely on Windows legacy console code pages or default file encodings for Chinese text.
+   - If Chinese output appears garbled, first suspect encoding boundaries: terminal code page, PowerShell input/output encoding, file read/write encoding, response charset, and copied text from external tools.
+   - Never "fix" mojibake by guessing or rewriting the Chinese text content unless the source encoding has been identified.
+
+15. NO SPACING RULE (CRITICAL):
+   - When Chinese characters meet English letters, numbers, or symbols, DO NOT use spaces at the **boundary** between them.
+   - Connect them directly. Example: use "文字a文字" instead of "文字 a 文字", "文字1文字" instead of "文字 1 文字", "文字+文字" instead of "文字 + 文字".
+   - **PRESERVE INTERNAL SPACES**: You MUST keep spaces between English words or numbers within their own segments.
+   - Example: use "a cake is here是的" (Correct) instead of "acakeishere是的" (Incorrect).
+
 ${agentMemoryPrompt}${skillPrompt}${clientToolsPrompt}`;
 
   if (normalized.length === 1 && normalized[0].role === "user") {
@@ -673,7 +801,22 @@ function loadSkills() {
       .map((entry) => {
         const filePath = path.join(dir, entry.name, "SKILL.md");
         if (!fs.existsSync(filePath)) return null;
-        const content = fs.readFileSync(filePath, "utf8");
+        
+        const buffer = fs.readFileSync(filePath);
+        let content;
+        try {
+          const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+          content = utf8Decoder.decode(buffer);
+        } catch (e) {
+          try {
+            const gbkDecoder = new TextDecoder("gbk");
+            content = gbkDecoder.decode(buffer);
+            console.log(`[Skills] Decoded ${filePath} using GBK`);
+          } catch (e2) {
+            content = buffer.toString("utf8");
+          }
+        }
+        
         return parseSkill(entry.name, filePath, content);
       })
       .filter(Boolean);
@@ -791,16 +934,208 @@ function normalizeContent(content) {
   if (Array.isArray(content)) {
     return content
       .map((part) => {
-        if (typeof part === "string") return part;
-        if (part?.type === "text") return part.text || "";
-        if (part?.type === "input_text") return part.text || "";
-        if (part?.text) return part.text;
-        return "";
+        const normalized = normalizeContentPart(part);
+        return normalized;
       })
       .filter(Boolean)
       .join("\n");
   }
+  if (typeof content === "object") {
+    return normalizeContentPart(content) || JSON.stringify(content);
+  }
   return JSON.stringify(content);
+}
+
+function mergeRequestAttachments(messages, body = {}) {
+  const attachmentFields = ["attachments", "files", "images", "items"];
+  if (!attachmentFields.some((field) => body[field])) return messages;
+
+  const nextMessages = messages.map((message) => ({ ...message }));
+  let targetIndex = nextMessages.length > 0 ? nextMessages.length - 1 : 0;
+  for (let i = nextMessages.length - 1; i >= 0; i -= 1) {
+    if (nextMessages[i].role !== "assistant") {
+      targetIndex = i;
+      break;
+    }
+  }
+  const target = nextMessages[targetIndex] || { role: "user", content: "" };
+
+  for (const field of attachmentFields) {
+    if (!body[field]) continue;
+    target[field] = [...toArray(target[field]), ...toArray(body[field])];
+  }
+
+  nextMessages[targetIndex] = target;
+  return nextMessages;
+}
+
+function normalizeMessageContent(message = {}) {
+  const sections = [normalizeContent(message.content)];
+  sections.push(normalizeAttachmentList("附件", message.attachments));
+  sections.push(normalizeAttachmentList("文件", message.files));
+  sections.push(normalizeAttachmentList("图片", message.images));
+  sections.push(normalizeAttachmentList("输入项", message.items));
+
+  return sections.filter(Boolean).join("\n\n");
+}
+
+function normalizeContentPart(part) {
+  if (part == null) return "";
+  if (typeof part === "string") return part;
+
+  const type = String(part.type || "").toLowerCase();
+  if (type === "text" || type === "input_text") return part.text || "";
+  if (part.text && !isAttachmentLike(type) && !hasAttachmentFields(part)) return part.text;
+
+  if (type === "image_url" || type === "input_image") {
+    return formatAttachmentLine("图片", {
+      url: part.image_url?.url || part.image_url || part.url,
+      path: part.path || part.file_path,
+      name: part.name || part.filename,
+      detail: part.detail || part.image_url?.detail,
+      fileId: part.file_id,
+    });
+  }
+
+  if (type === "local_image") {
+    return formatAttachmentLine("本地图片", {
+      path: part.path || part.file_path,
+      name: part.name || part.filename,
+      detail: part.detail,
+    });
+  }
+
+  if (type === "file" || type === "input_file" || type === "local_file") {
+    return formatAttachmentLine("文件", {
+      url: part.file?.url || part.url,
+      path: part.path || part.file_path || part.file?.path,
+      name: part.name || part.filename || part.file?.filename,
+      data: part.file_data || part.file?.file_data,
+      fileId: part.file_id || part.file?.file_id,
+    });
+  }
+
+  if (type === "mention") {
+    return formatAttachmentLine("引用", {
+      url: part.url,
+      path: part.path,
+      name: part.name,
+    });
+  }
+
+  return formatAttachmentLine(type || "结构化输入", part);
+}
+
+function normalizeAttachmentList(label, value) {
+  if (!value) return "";
+  const items = Array.isArray(value) ? value : [value];
+  return items
+    .map((item) => {
+      if (typeof item === "string") {
+        return formatAttachmentLine(label, { path: item, url: item });
+      }
+      return normalizeContentPart({ type: label, ...item });
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatAttachmentLine(label, item = {}) {
+  const name = item.name || item.filename || item.title || "";
+  const url = normalizeAttachmentUrl(item.url || item.image_url);
+  const localPath = normalizeAttachmentPath(item.path || item.file_path || url);
+  const savedPath = saveDataUrlAttachment(url || item.data, name);
+  const pieces = [];
+
+  if (name) pieces.push(`名称: ${name}`);
+  if (localPath) pieces.push(`本地路径: ${localPath}`);
+  if (savedPath) pieces.push(`已保存到: ${savedPath}`);
+  if (url && !url.startsWith("data:") && !localPath) pieces.push(`URL: ${url}`);
+  if (item.detail) pieces.push(`细节: ${item.detail}`);
+  if (item.fileId) pieces.push(`文件ID: ${item.fileId}`);
+
+  if (pieces.length === 0 && item.text) return item.text;
+  if (pieces.length === 0) return "";
+
+  return `[WorkBuddy ${label}] ${pieces.join("；")}`;
+}
+
+function normalizeAttachmentUrl(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  return value.url || value.href || "";
+}
+
+function toArray(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function normalizeAttachmentPath(value) {
+  if (!value || typeof value !== "string") return "";
+  if (value.startsWith("file://")) {
+    try {
+      const decoded = decodeURIComponent(value.replace(/^file:\/+/, ""));
+      return process.platform === "win32" ? decoded.replace(/^\//, "").replace(/\//g, "\\") : `/${decoded}`;
+    } catch {
+      return value;
+    }
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("\\\\") || value.startsWith("/")) return value;
+  return "";
+}
+
+function saveDataUrlAttachment(value, name = "") {
+  if (typeof value !== "string" || !value.startsWith("data:")) return "";
+
+  const match = value.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/);
+  if (!match) return "";
+
+  const mime = match[1] || "application/octet-stream";
+  const ext = extensionFromMime(mime);
+  const safeName = sanitizeFileName(path.parse(name || "attachment").name || "attachment");
+  const filePath = path.join(ATTACHMENTS_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}${ext}`);
+
+  try {
+    fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+    fs.writeFileSync(filePath, Buffer.from(match[2], "base64"));
+    return filePath;
+  } catch (error) {
+    console.error("[attachments] Failed to save data URL:", error.message);
+    return "";
+  }
+}
+
+function extensionFromMime(mime) {
+  const normalized = String(mime || "").toLowerCase();
+  if (normalized === "image/png") return ".png";
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return ".jpg";
+  if (normalized === "image/webp") return ".webp";
+  if (normalized === "image/gif") return ".gif";
+  if (normalized === "application/pdf") return ".pdf";
+  if (normalized === "text/plain") return ".txt";
+  return ".bin";
+}
+
+function sanitizeFileName(value) {
+  return String(value || "attachment").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").slice(0, 80) || "attachment";
+}
+
+function isAttachmentLike(type) {
+  return ["image_url", "input_image", "local_image", "file", "input_file", "local_file", "mention"].includes(type);
+}
+
+function hasAttachmentFields(value = {}) {
+  return Boolean(
+    value.path ||
+      value.file_path ||
+      value.url ||
+      value.image_url ||
+      value.file ||
+      value.file_data ||
+      value.filename ||
+      value.name
+  );
 }
 
 function resolveWorkdir(body = {}) {
@@ -832,10 +1167,6 @@ function consumeLines(buffer, onLine) {
 
 function stripAnsi(text) {
   return String(text).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
-}
-
-function ensureTrailingBlankLine(text) {
-  return text.endsWith("\n") ? text : `${text}\n\n`;
 }
 
 function makeId(prefix) {
