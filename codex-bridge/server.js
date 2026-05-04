@@ -1,4 +1,4 @@
-﻿﻿const express = require("express");
+﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -94,6 +94,67 @@ app.get(["/", "/health"], (req, res) => {
   });
 });
 
+function handleProgress(res, text, { progressSteps, hasSentProgressHeader, model, progressId, created }) {
+  if (!text) return hasSentProgressHeader;
+
+  // 清理常见的包装字符和冗余提示
+  let clean = text
+    .replace(/\*\*✅ 进度更新\*\*/g, "")
+    .replace(/\*\*✅ 任务完成总结\*\*/g, "")
+    .replace(/\*\*⏳ 运行状态\*\*/g, "")
+    .replace(/\*\*⏳ 正在处理\*\*/g, "")
+    .replace(/^- \[[ x]\] /g, "")
+    .replace(/，详细过程见服务端终端。?/, "")
+    .trim();
+
+  if (!clean) return hasSentProgressHeader;
+
+  // 检查是否包含之前的步骤，实现增量更新
+  // 如果当前内容只是在之前步骤后面加了新内容，我们只取新增的部分
+  for (const step of progressSteps) {
+    if (clean === step || step.includes(clean)) return hasSentProgressHeader;
+    if (clean.startsWith(step)) {
+      clean = clean.slice(step.length).trim();
+    }
+  }
+
+  if (!clean || clean.length < 2) return hasSentProgressHeader;
+
+  progressSteps.push(clean);
+  let delta = "";
+  let updatedHasSentHeader = hasSentProgressHeader;
+
+  if (!updatedHasSentHeader) {
+    delta += `\n\n**⏳ 正在处理**\n`;
+    updatedHasSentHeader = true;
+  }
+
+  // 更加智能的分段：优先按换行符，如果没有换行符则尝试按标点符号拆分
+  let segments = clean.split(/\n+/).filter(s => s.trim().length > 0);
+  
+  if (segments.length === 1 && clean.length > 40) {
+    // 只有一段且比较长，尝试按标点拆分
+    segments = clean.split(/([。；！!？?])\s*/).reduce((acc, part, i) => {
+      if (i % 2 === 0) acc.push(part);
+      else if (acc.length > 0) acc[acc.length - 1] += part;
+      return acc;
+    }, []).filter(s => s.trim().length > 0);
+  }
+  
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (trimmed) {
+      delta += `- ${trimmed}\n`;
+    }
+  }
+
+  if (delta) {
+    sendChatChunk(res, progressId, model, delta, created);
+  }
+  
+  return updatedHasSentHeader;
+}
+
 app.post("/codex", async (req, res) => {
   const rawPrompt = normalizeMessageContent({
     content: req.body.prompt,
@@ -138,17 +199,13 @@ app.post("/codex", async (req, res) => {
       },
       onProgress: (text) => {
         if (wantsStream && STREAM_PROGRESS) {
-          const clean = text.replace(/\*\*✅ 进度更新\*\*/g, "").replace(/^- \[[ x]\] /g, "").replace(/，详细过程见服务端终端。?/, "").trim();
-          if (clean && !progressSteps.includes(clean)) {
-            progressSteps.push(clean);
-            let delta = "";
-            if (!hasSentProgressHeader) {
-              delta += `\n\n**✅ 进度更新**\n`;
-              hasSentProgressHeader = true;
-            }
-            delta += `- [x] ${clean}\n`;
-            sendChatChunk(res, progressId, model, delta);
-          }
+          hasSentProgressHeader = handleProgress(res, text, { 
+            progressSteps, 
+            hasSentProgressHeader, 
+            model, 
+            progressId, 
+            created: Math.floor(Date.now() / 1000) 
+          });
         }
       },
       signalClose: res,
@@ -233,17 +290,13 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
       },
       onProgress: (text) => {
         if (wantsStream && STREAM_PROGRESS) {
-          const clean = text.replace(/\*\*✅ 进度更新\*\*/g, "").replace(/^- \[[ x]\] /g, "").replace(/，详细过程见服务端终端。?/, "").trim();
-          if (clean && !progressSteps.includes(clean)) {
-            progressSteps.push(clean);
-            let delta = "";
-            if (!hasSentProgressHeader) {
-              delta += `\n\n**✅ 进度更新**\n`;
-              hasSentProgressHeader = true;
-            }
-            delta += `- [x] ${clean}\n`;
-            sendChatChunk(res, progressId, model, delta, created);
-          }
+          hasSentProgressHeader = handleProgress(res, text, { 
+            progressSteps, 
+            hasSentProgressHeader, 
+            model, 
+            progressId, 
+            created 
+          });
         }
       },
       signalClose: res,
@@ -330,9 +383,11 @@ function runCodex({ prompt, model, cwd, onText, onDebug, onProgress, onUsage, si
       "--dangerously-bypass-approvals-and-sandbox",
     ];
 
-    const targetModel = model || CODEX_MODEL;
-    if (targetModel) {
-      args.push("-m", targetModel);
+    // 优先且仅使用后端定义的 CODEX_MODEL。
+    // 如果 CODEX_MODEL 为空，则不传递 -m 参数，让 codex CLI 使用其内部配置的默认模型。
+    // 这样可以完全忽略前端传来的模型选择。
+    if (CODEX_MODEL) {
+      args.push("-m", CODEX_MODEL);
     }
 
     args.push("-");
@@ -442,7 +497,18 @@ function runCodex({ prompt, model, cwd, onText, onDebug, onProgress, onUsage, si
 
       if (code !== 0) {
         const detail = stripAnsi(stderrBuffer).trim();
-        finish(reject, new Error(`Codex exited with code ${code}${detail ? `: ${detail}` : ""}`));
+        let errorMessage = `Codex exited with code ${code}`;
+        
+        if (detail.includes("401 Unauthorized") || detail.includes("token_revoked") || detail.includes("refresh_token_reused")) {
+          errorMessage = "身份验证过期 (401 Unauthorized)。请在终端运行 `codex login` 重新登录。";
+        } else if (detail) {
+          // 提取最后几行关键错误
+          const lines = detail.split('\n');
+          const lastError = lines.reverse().find(l => l.includes("ERROR") || l.includes("Error"));
+          errorMessage += lastError ? `: ${lastError}` : `: ${detail.slice(-200)}`;
+        }
+        
+        finish(reject, new Error(errorMessage));
         return;
       }
 
