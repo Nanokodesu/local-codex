@@ -1,4 +1,4 @@
-﻿﻿const express = require("express");
+﻿﻿﻿﻿﻿﻿﻿﻿const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -175,19 +175,45 @@ app.post("/codex", async (req, res) => {
   }
 
   let output = "";
+  let pendingDebug = "";
   try {
     await runCodex({
       prompt,
       model,
       cwd: workdir.path,
       onText: (text, options = {}) => {
-        if (options.includeInFinal !== false) output += text;
-        if (wantsStream) sendChatChunk(res, responseId, model, text);
-      },
+          if (options.includeInFinal !== false) output += text;
+          if (!wantsStream) return;
+
+          // 自动刷新逻辑：如果缓冲区有推理内容，且当前正文出现了换行符（段落结束）
+          // 或者正文显式包含了 [Thinking] 触发词
+          const shouldFlush = pendingDebug && (text.includes("\n") || text.includes("[Thinking]"));
+          
+          if (shouldFlush) {
+            let processedText = text;
+            if (text.includes("[Thinking]")) {
+              const parts = text.split("[Thinking]");
+              // 发送触发词前的部分
+              if (parts[0]) sendChatChunk(res, responseId, model, parts[0]);
+              // 注入推理内容
+              sendChatChunk(res, responseId, model, pendingDebug, Math.floor(Date.now() / 1000), true);
+              pendingDebug = "";
+              // 发送触发词后的部分
+              if (parts[1]) sendChatChunk(res, responseId, model, parts[1]);
+            } else {
+              // 遇到换行自动注入
+              sendChatChunk(res, responseId, model, pendingDebug, Math.floor(Date.now() / 1000), true);
+              pendingDebug = "";
+              sendChatChunk(res, responseId, model, text);
+            }
+          } else {
+            sendChatChunk(res, responseId, model, text);
+          }
+        },
       onDebug: (text) => {
         if (wantsStream && STREAM_CODEX_EVENTS) {
-          // 将调试信息（命令细节等）发送到 reasoning_content
-          sendChatChunk(res, responseId, model, text, Math.floor(Date.now() / 1000), true);
+          // 将调试信息累积，等待（）触发
+          pendingDebug += text;
         }
       },
       onProgress: (text) => {
@@ -204,6 +230,9 @@ app.post("/codex", async (req, res) => {
     });
 
     if (wantsStream) {
+      if (pendingDebug) {
+        sendChatChunk(res, responseId, model, pendingDebug, Math.floor(Date.now() / 1000), true);
+      }
       sendDone(res, responseId, model);
     } else {
       res.json({ output: output.trim() });
@@ -263,6 +292,7 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
 
   let finalContent = "";
   let usage = null;
+  let pendingDebug = "";
 
   try {
     await runCodex({
@@ -274,12 +304,33 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
       },
       onText: (text, options = {}) => {
         if (options.includeInFinal !== false) finalContent += text;
-        if (wantsStream) sendChatChunk(res, responseId, model, text, created);
+        if (!wantsStream) return;
+
+        // 自动刷新逻辑：如果缓冲区有推理内容，且当前正文出现了换行符（段落结束）
+        // 或者正文显式包含了 [Thinking] 触发词
+        const shouldFlush = pendingDebug && (text.includes("\n") || text.includes("[Thinking]"));
+        
+        if (shouldFlush) {
+          if (text.includes("[Thinking]")) {
+            const parts = text.split("[Thinking]");
+            if (parts[0]) sendChatChunk(res, responseId, model, parts[0], created);
+            sendChatChunk(res, responseId, model, pendingDebug, created, true);
+            pendingDebug = "";
+            if (parts[1]) sendChatChunk(res, responseId, model, parts[1], created);
+          } else {
+            // 遇到换行自动注入推理内容
+            sendChatChunk(res, responseId, model, pendingDebug, created, true);
+            pendingDebug = "";
+            sendChatChunk(res, responseId, model, text, created);
+          }
+        } else {
+          sendChatChunk(res, responseId, model, text, created);
+        }
       },
       onDebug: (text) => {
         if (wantsStream && STREAM_CODEX_EVENTS) {
-          // 将调试信息（命令细节等）发送到 reasoning_content
-          sendChatChunk(res, responseId, model, text, created, true);
+          // 将调试信息累积，等待（）触发或最终发送
+          pendingDebug += text;
         }
       },
       onProgress: (text) => {
@@ -296,6 +347,10 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
     });
 
     if (wantsStream) {
+      // 发送剩余的调试信息（如果有）
+      if (pendingDebug) {
+        sendChatChunk(res, responseId, model, pendingDebug, created, true);
+      }
       sendDone(res, responseId, model, created);
       return;
     }
@@ -750,6 +805,8 @@ You are a HIGHLY AUTONOMOUS ELITE DEVELOPER. You don't just follow instructions;
 3. THINKING PROCESS (Chain of Thought):
 **🤔 深度思考**
 (1. Investigation Phase: What do I need to search locally/online to fully understand the context? 2. Analysis: What are the core findings and potential risks? 3. Creative Design: What is the most robust and elegant solution? 4. Verification Plan: How will I prove it works?)
+   - **THINKING BLOCKS**: Your tool execution logs and background reasoning will automatically appear between paragraphs in the final response.
+   - **EXPLICIT TRIGGER**: If you want to force the thinking block to appear at a specific location, use the \`[Thinking]\` tag.
 
 4. PLANNING & PROGRESS:
    - At the VERY START of your response (immediately after Thinking), provide your intelligence-driven task list:
