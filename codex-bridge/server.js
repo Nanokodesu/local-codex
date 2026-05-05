@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require("express");
+﻿﻿const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -94,8 +94,8 @@ app.get(["/", "/health"], (req, res) => {
   });
 });
 
-function handleProgress(res, text, { progressSteps, hasSentProgressHeader, model, progressId, created }) {
-  if (!text) return hasSentProgressHeader;
+function handleProgress(res, text, { progressSteps, model, responseId, created }) {
+  if (!text) return;
 
   // 清理常见的包装字符和冗余提示
   let clean = text
@@ -107,33 +107,25 @@ function handleProgress(res, text, { progressSteps, hasSentProgressHeader, model
     .replace(/，详细过程见服务端终端。?/, "")
     .trim();
 
-  if (!clean) return hasSentProgressHeader;
+  if (!clean) return;
 
   // 检查是否包含之前的步骤，实现增量更新
-  // 如果当前内容只是在之前步骤后面加了新内容，我们只取新增的部分
   for (const step of progressSteps) {
-    if (clean === step || step.includes(clean)) return hasSentProgressHeader;
+    if (clean === step || step.includes(clean)) return;
     if (clean.startsWith(step)) {
       clean = clean.slice(step.length).trim();
     }
   }
 
-  if (!clean || clean.length < 2) return hasSentProgressHeader;
+  if (!clean || clean.length < 2) return;
 
   progressSteps.push(clean);
   let delta = "";
-  let updatedHasSentHeader = hasSentProgressHeader;
 
-  if (!updatedHasSentHeader) {
-    delta += `\n\n**⏳ 正在处理**\n`;
-    updatedHasSentHeader = true;
-  }
-
-  // 更加智能的分段：优先按换行符，如果没有换行符则尝试按标点符号拆分
+  // 更加智能的分段
   let segments = clean.split(/\n+/).filter(s => s.trim().length > 0);
   
   if (segments.length === 1 && clean.length > 40) {
-    // 只有一段且比较长，尝试按标点拆分
     segments = clean.split(/([。；！!？?])\s*/).reduce((acc, part, i) => {
       if (i % 2 === 0) acc.push(part);
       else if (acc.length > 0) acc[acc.length - 1] += part;
@@ -144,15 +136,14 @@ function handleProgress(res, text, { progressSteps, hasSentProgressHeader, model
   for (const segment of segments) {
     const trimmed = segment.trim();
     if (trimmed) {
-      delta += `- ${trimmed}\n`;
+      delta += `\n> ⏳ ${trimmed}`;
     }
   }
 
   if (delta) {
-    sendChatChunk(res, progressId, model, delta, created);
+    // 使用 reasoning_content 发送，这样 UI 会将其显示为“思考”过程
+    sendChatChunk(res, responseId, model, delta, created, true);
   }
-  
-  return updatedHasSentHeader;
 }
 
 app.post("/codex", async (req, res) => {
@@ -175,10 +166,9 @@ app.post("/codex", async (req, res) => {
 
   const wantsStream = req.body.stream === true;
   const responseId = makeId("codex");
-  const model = req.body.model || "codex";
-  const progressId = makeId("progress");
+  // 优先使用后端环境变量定义的模型，实现后端自主控制
+  const model = CODEX_MODEL || req.body.model || "codex";
   const progressSteps = [];
-  let hasSentProgressHeader = false;
 
   if (wantsStream) {
     startSse(res);
@@ -195,16 +185,18 @@ app.post("/codex", async (req, res) => {
         if (wantsStream) sendChatChunk(res, responseId, model, text);
       },
       onDebug: (text) => {
-        if (wantsStream && STREAM_CODEX_EVENTS) sendChatChunk(res, responseId, model, text);
+        if (wantsStream && STREAM_CODEX_EVENTS) {
+          // 将调试信息（命令细节等）发送到 reasoning_content
+          sendChatChunk(res, responseId, model, text, Math.floor(Date.now() / 1000), true);
+        }
       },
       onProgress: (text) => {
         if (wantsStream && STREAM_PROGRESS) {
-          hasSentProgressHeader = handleProgress(res, text, { 
-            progressSteps, 
-            hasSentProgressHeader, 
-            model, 
-            progressId, 
-            created: Math.floor(Date.now() / 1000) 
+          handleProgress(res, text, {
+            progressSteps,
+            model,
+            responseId,
+            created: Math.floor(Date.now() / 1000)
           });
         }
       },
@@ -229,7 +221,8 @@ app.post("/codex", async (req, res) => {
 app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
   const { messages, stream, tools } = req.body;
   const wantsStream = stream === true;
-  const model = req.body.model || "codex";
+  // 优先使用后端环境变量定义的模型，实现后端自主控制
+  const model = CODEX_MODEL || req.body.model || "codex";
   const responseId = makeId("chatcmpl");
   const created = Math.floor(Date.now() / 1000);
 
@@ -262,9 +255,7 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
     });
   }
 
-  const progressId = makeId("progress");
   const progressSteps = [];
-  let hasSentProgressHeader = false;
 
   if (wantsStream) {
     startSse(res);
@@ -286,15 +277,17 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
         if (wantsStream) sendChatChunk(res, responseId, model, text, created);
       },
       onDebug: (text) => {
-        if (wantsStream && STREAM_CODEX_EVENTS) sendChatChunk(res, responseId, model, text, created);
+        if (wantsStream && STREAM_CODEX_EVENTS) {
+          // 将调试信息（命令细节等）发送到 reasoning_content
+          sendChatChunk(res, responseId, model, text, created, true);
+        }
       },
       onProgress: (text) => {
         if (wantsStream && STREAM_PROGRESS) {
-          hasSentProgressHeader = handleProgress(res, text, { 
+          handleProgress(res, text, { 
             progressSteps, 
-            hasSentProgressHeader, 
             model, 
-            progressId, 
+            responseId, 
             created 
           });
         }
@@ -643,8 +636,10 @@ function startSse(res) {
   res.write(": connected\n\n");
 }
 
-function sendChatChunk(res, id, model, text, created = Math.floor(Date.now() / 1000)) {
+function sendChatChunk(res, id, model, text, created = Math.floor(Date.now() / 1000), isReasoning = false) {
   if (!text || res.writableEnded) return;
+
+  const delta = isReasoning ? { reasoning_content: text } : { content: text };
 
   const chunk = {
     id,
@@ -654,9 +649,7 @@ function sendChatChunk(res, id, model, text, created = Math.floor(Date.now() / 1
     choices: [
       {
         index: 0,
-        delta: {
-          content: text,
-        },
+        delta,
         finish_reason: null,
       },
     ],
