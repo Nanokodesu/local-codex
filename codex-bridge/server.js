@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -14,6 +14,8 @@ const STREAM_PROGRESS = process.env.CODEX_STREAM_PROGRESS !== "false";
 const STREAM_CODEX_EVENTS = process.env.CODEX_STREAM_EVENTS !== "false";
 const STREAM_COMMAND_OUTPUT = process.env.CODEX_STREAM_COMMAND_OUTPUT === "true";
 const TERMINAL_COMMAND_OUTPUT_PREVIEW = Number(process.env.CODEX_TERMINAL_COMMAND_OUTPUT_PREVIEW || 2000);
+const COMMAND_PROGRESS_HEARTBEAT_MS = Number(process.env.CODEX_COMMAND_PROGRESS_HEARTBEAT_MS || 8000);
+const MAX_NATURAL_TEXT_CHUNK = Number(process.env.CODEX_MAX_NATURAL_TEXT_CHUNK || 120);
 const SKILLS_DIR = process.env.CODEX_SKILLS_DIR || path.join(process.cwd(), "skills");
 const MAX_MATCHED_SKILLS = Number(process.env.CODEX_MAX_MATCHED_SKILLS || 3);
 const ATTACHMENTS_DIR = process.env.CODEX_ATTACHMENTS_DIR || path.join(os.tmpdir(), "codex-bridge-attachments");
@@ -97,7 +99,6 @@ app.get(["/", "/health"], (req, res) => {
 function handleProgress(res, text, { progressSteps, model, responseId, created }) {
   if (!text) return;
 
-  // 清理常见的包装字符和冗余提示
   let clean = text
     .replace(/\*\*✅ 进度更新\*\*/g, "")
     .replace(/\*\*✅ 任务完成总结\*\*/g, "")
@@ -109,20 +110,6 @@ function handleProgress(res, text, { progressSteps, model, responseId, created }
 
   if (!clean) return;
 
-  // 检查是否包含之前的步骤，实现增量更新
-  for (const step of progressSteps) {
-    if (clean === step || step.includes(clean)) return;
-    if (clean.startsWith(step)) {
-      clean = clean.slice(step.length).trim();
-    }
-  }
-
-  if (!clean || clean.length < 2) return;
-
-  progressSteps.push(clean);
-  let delta = "";
-
-  // 更加智能的分段
   let segments = clean.split(/\n+/).filter(s => s.trim().length > 0);
   
   if (segments.length === 1 && clean.length > 40) {
@@ -134,14 +121,17 @@ function handleProgress(res, text, { progressSteps, model, responseId, created }
   }
   
   for (const segment of segments) {
-    const trimmed = segment.trim();
-    if (trimmed) {
-      delta += `\n> ⏳ ${trimmed}`;
-    }
-  }
+    const trimmed = segment.replace(/\s+/g, " ").trim();
+    if (!trimmed || trimmed.length < 2) continue;
+    if (progressSteps.includes(trimmed)) continue;
+    if (progressSteps.some((step) => step.includes(trimmed))) continue;
 
-  if (delta) {
-    // 使用 reasoning_content 发送，这样 UI 会将其显示为“思考”过程
+    const previousPrefix = progressSteps.find((step) => trimmed.startsWith(step));
+    const next = previousPrefix ? trimmed.slice(previousPrefix.length).trim() : trimmed;
+    if (!next || next.length < 2 || progressSteps.includes(next)) continue;
+
+    progressSteps.push(next);
+    const delta = `\n\n> ⏳ ${next}\n\n`;
     sendChatChunk(res, responseId, model, delta, created, true);
   }
 }
@@ -189,30 +179,28 @@ app.post("/codex", async (req, res) => {
           // 或者正文显式包含了 [Thinking] 触发词
           const shouldFlush = pendingDebug && (text.includes("\n") || text.includes("[Thinking]"));
           
-          if (shouldFlush) {
-            let processedText = text;
-            if (text.includes("[Thinking]")) {
+           if (shouldFlush) {
+             if (text.includes("[Thinking]")) {
               const parts = text.split("[Thinking]");
               // 发送触发词前的部分
-              if (parts[0]) sendChatChunk(res, responseId, model, parts[0]);
+              if (parts[0]) sendContentChunk(res, responseId, model, parts[0]);
               // 注入推理内容
               sendChatChunk(res, responseId, model, pendingDebug, Math.floor(Date.now() / 1000), true);
               pendingDebug = "";
               // 发送触发词后的部分
-              if (parts[1]) sendChatChunk(res, responseId, model, parts[1]);
+              if (parts[1]) sendContentChunk(res, responseId, model, parts[1]);
             } else {
               // 遇到换行自动注入
               sendChatChunk(res, responseId, model, pendingDebug, Math.floor(Date.now() / 1000), true);
               pendingDebug = "";
-              sendChatChunk(res, responseId, model, text);
+              sendContentChunk(res, responseId, model, text);
             }
           } else {
-            sendChatChunk(res, responseId, model, text);
+            sendContentChunk(res, responseId, model, text);
           }
         },
       onDebug: (text) => {
         if (wantsStream && STREAM_CODEX_EVENTS) {
-          // 将调试信息累积，等待（）触发
           pendingDebug += text;
         }
       },
@@ -313,23 +301,22 @@ app.post([/^\/.*chat\/completions$/, /^\/v1$/], async (req, res) => {
         if (shouldFlush) {
           if (text.includes("[Thinking]")) {
             const parts = text.split("[Thinking]");
-            if (parts[0]) sendChatChunk(res, responseId, model, parts[0], created);
+            if (parts[0]) sendContentChunk(res, responseId, model, parts[0], created);
             sendChatChunk(res, responseId, model, pendingDebug, created, true);
             pendingDebug = "";
-            if (parts[1]) sendChatChunk(res, responseId, model, parts[1], created);
+            if (parts[1]) sendContentChunk(res, responseId, model, parts[1], created);
           } else {
             // 遇到换行自动注入推理内容
             sendChatChunk(res, responseId, model, pendingDebug, created, true);
             pendingDebug = "";
-            sendChatChunk(res, responseId, model, text, created);
+            sendContentChunk(res, responseId, model, text, created);
           }
         } else {
-          sendChatChunk(res, responseId, model, text, created);
+          sendContentChunk(res, responseId, model, text, created);
         }
       },
       onDebug: (text) => {
         if (wantsStream && STREAM_CODEX_EVENTS) {
-          // 将调试信息累积，等待（）触发或最终发送
           pendingDebug += text;
         }
       },
@@ -476,6 +463,7 @@ function runCodex({ prompt, model, cwd, onText, onDebug, onProgress, onUsage, si
         signalClose.off?.("close", abortHandler);
         signalClose.off?.("aborted", abortHandler);
       }
+      clearCommandTimers(commandStates);
     };
 
     const abortHandler = () => {
@@ -601,21 +589,41 @@ function handleCodexEvent(event, { onText, onDebug, onProgress, onUsage, command
   }
 }
 
+function clearCommandTimers(commandStates) {
+  for (const state of commandStates.values()) {
+    if (state?.timer) clearInterval(state.timer);
+  }
+}
+
 function handleCommandEvent(event, item, { onProgress, commandStates }) {
   if (event.type === "item.started") {
     if (!STREAM_CODEX_EVENTS) return;
 
     const cmd = formatCommand(item.command || "");
     const summary = summarizeCommand(cmd);
-    commandStates.set(item.id, { 
+    const startedAt = Date.now();
+    const state = { 
       outputLength: 0, 
       command: cmd,
       summary,
       truncated: false,
-      displayedLength: 0 
-    });
+      displayedLength: 0,
+      startedAt,
+      lastProgressAt: startedAt,
+      timer: null,
+    };
+    if (COMMAND_PROGRESS_HEARTBEAT_MS > 0) {
+      state.timer = setInterval(() => {
+        const latest = commandStates.get(item.id);
+        if (!latest) return;
+        const elapsed = formatDuration(Date.now() - latest.startedAt);
+        onProgress?.(`${latest.summary}进行中，已用${elapsed}。`);
+      }, COMMAND_PROGRESS_HEARTBEAT_MS);
+      state.timer.unref?.();
+    }
+    commandStates.set(item.id, state);
     console.log(`[codex command] started: ${cmd}`);
-    onProgress?.(`${summary}`);
+    onProgress?.(`${summary}：${describeCommandTarget(cmd)}`);
     return;
   }
 
@@ -644,13 +652,22 @@ function handleCommandEvent(event, item, { onProgress, commandStates }) {
     }
     
     state.outputLength = item.aggregated_output.length;
+    const now = Date.now();
+    if (now - (state.lastProgressAt || 0) >= Math.max(2000, COMMAND_PROGRESS_HEARTBEAT_MS / 2)) {
+      state.lastProgressAt = now;
+      onProgress?.(`${state.summary}收到新输出，当前约${state.outputLength}字符。`);
+    }
     commandStates.set(item.id, state);
   }
 
   if (event.type === "item.completed") {
     const exitCode = item.exit_code ?? "unknown";
     const isSuccess = exitCode === 0 || exitCode === "0";
-    const status = isSuccess ? `${state.summary || "本地命令"}已完成` : `${state.summary || "本地命令"}失败，退出码：${exitCode}`;
+    const summary = state.summary || "本地命令";
+    const subject = summary.replace(/^正在/, "");
+    if (state.timer) clearInterval(state.timer);
+    const elapsed = state.startedAt ? `，耗时${formatDuration(Date.now() - state.startedAt)}` : "";
+    const status = isSuccess ? `${subject}已完成${elapsed}` : `${subject}失败，退出码：${exitCode}${elapsed}`;
     console.log(`[codex command] completed (${exitCode}): ${state.command || formatCommand(item.command || "")}`);
     onProgress?.(`${status}`);
     commandStates.delete(item.id);
@@ -667,6 +684,32 @@ function formatCommand(command) {
   return cmd.length > 120 ? `${cmd.substring(0, 117)}...` : cmd;
 }
 
+function describeCommandTarget(command) {
+  const cmd = String(command || "").trim();
+  if (!cmd) return "准备执行本地操作";
+
+  const pathMatch =
+    cmd.match(/(?:-Path|-LiteralPath|cwd)\s+["']?([^"'\s;|]+(?:\s[^"';|]+)?)["']?/i) ||
+    cmd.match(/\b([A-Z]:\\[^;|"'`]+|\/[^;|"'`]+)\b/i);
+  const target = pathMatch?.[1]?.trim();
+  const suffix = target ? `目标${formatShortTarget(target)}` : "正在分析命令目标";
+  return suffix;
+}
+
+function formatShortTarget(target) {
+  const normalized = String(target || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= 60) return `：${normalized}`;
+  return `：...${normalized.slice(-57)}`;
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes}m${seconds}s` : `${minutes}m`;
+}
+
 function summarizeCommand(command) {
   const cmd = String(command || "").toLowerCase();
 
@@ -675,6 +718,7 @@ function summarizeCommand(command) {
   if (cmd.includes("npm test") || cmd.includes("pytest") || cmd.includes("vitest") || cmd.includes("jest")) return "正在运行测试";
   if (cmd.includes("npm run build") || cmd.includes("vite build") || cmd.includes("next build")) return "正在构建项目";
   if (cmd.includes("rg ") || cmd.includes("select-string") || cmd.includes("findstr")) return "正在搜索代码";
+  if (cmd.includes("get-childitem") && (cmd.includes("-recurse") || cmd.includes("-filter") || cmd.includes("-include"))) return "正在扫描本地文件线索";
   if (cmd.includes("get-content") || cmd.includes("type ") || cmd.includes("cat ")) return "正在读取文件内容";
   if (cmd.includes("git diff") || cmd.includes("git status")) return "正在检查代码变更";
   if (cmd.includes("get-childitem") || cmd.includes(" ls ") || cmd.startsWith("ls ")) return "正在查看项目文件";
@@ -689,6 +733,31 @@ function startSse(res) {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
   res.write(": connected\n\n");
+}
+
+function sendContentChunk(res, id, model, text, created = Math.floor(Date.now() / 1000)) {
+  for (const part of splitNaturalTextForDisplay(text)) {
+    sendChatChunk(res, id, model, part, created);
+  }
+}
+
+function splitNaturalTextForDisplay(text) {
+  const value = String(text || "");
+  if (!value || value.length <= MAX_NATURAL_TEXT_CHUNK) return [value];
+  if (value.includes("```") || value.includes("|") || /^\s*([-*]|\d+\.|#{1,6}\s)/m.test(value)) return [value];
+
+  const parts = [];
+  let buffer = "";
+  for (const token of value.split(/([。！？!?；;]\s*)/)) {
+    if (!token) continue;
+    buffer += token;
+    if (buffer.length >= MAX_NATURAL_TEXT_CHUNK && /[。！？!?；;]\s*$/.test(buffer)) {
+      parts.push(`${buffer.trimEnd()}\n\n`);
+      buffer = "";
+    }
+  }
+  if (buffer) parts.push(buffer);
+  return parts.length ? parts : [value];
 }
 
 function sendChatChunk(res, id, model, text, created = Math.floor(Date.now() / 1000), isReasoning = false) {
@@ -814,12 +883,34 @@ You are a HIGHLY AUTONOMOUS ELITE DEVELOPER. You don't just follow instructions;
 - [ ] (Investigation task)
 - [ ] (Implementation task)
 - [ ] (Verification/Testing task)
-   - During your response, provide status updates in NATURAL LANGUAGE only. 
+   - During your response, provide status updates in NATURAL LANGUAGE only.
+   - Each status update must be its own short paragraph. Do not concatenate multiple updates into one long paragraph.
+   - Keep every status update to 1-2 concise sentences. After each status update, insert a blank line before continuing.
+   - When you have several actions or observations to report, split them into separate paragraphs instead of joining them with spaces or long comma chains.
+   - For long-running searches, scans, builds, installs, or data processing, describe the visible work process incrementally: current scope, target file types or keywords, what has been found so far, and what the next stage will verify.
+   - When exploring files, searches, or command output, do not wait until the end to explain progress; emit concise stage updates as the work advances.
    - DO NOT output the "✅ 进度更新" block yourself; the system will handle the real-time progress bar at the top of the message.
-   - At the VERY END of your response, after all work is done, provide a final summary:
+   - At the VERY END of your response, after all work is done, provide a comprehensive final summary including natural language descriptions, task checklists, and file change tables:
 **✅ 任务完成总结**
+
+**执行逻辑**
+Use 2-3 concise natural-language sentences to explain what you changed, why this approach was chosen, and how it addresses the user's request.
+
+**📋 执行明细**
 - [x] (Completed Task 1)
 - [x] (Completed Task 2)
+
+**📄 变更明细**
+| 文件路径 | 状态 | 变更 (Lines) | 核心改动说明 |
+| :--- | :--- | :--- | :--- |
+| \`path/to/file.ext\` | 已修改 | +n -m | 简要描述改动点 |
+| \`another/file.ext\` | 已创建 | +x -0 | 新增功能说明 |
+
+**验证与决策**
+Summarize checks run, results, and important implementation decisions.
+
+Keep a blank line before and after every heading and Markdown table. Never collapse the table into plain inline text.
+If only one file changed, still render the Markdown table with pipes and the separator row.
 
 5. FILE OPERATIONS: After you modify, create, or read a file, explicitly state the result using one of these formats:
 📄 \`filename.ext\` *(已创建/已修改)* **+n -m** (n = lines added, m = lines removed)
@@ -869,12 +960,19 @@ You are a HIGHLY AUTONOMOUS ELITE DEVELOPER. You don't just follow instructions;
    - When an attachment line says a data URL was saved, inspect the saved local file path.
    - Do not paste full file contents or binary data into chat; summarize what you inspected and cite the path.
 
-13. FINAL SUMMARY:
-   - You MUST NOT end any final response without a concise end-of-answer summary section titled "**✅ 任务完成总结**".
-   - Summarize meaningful actions completed, files changed or inspected, decisions made, and verification results.
-   - If you modified files, explicitly list each changed file with the same file-operation format from Rule 5.
-   - If you did not modify files, explicitly say "未修改文件".
-   - Keep this final summary short and high-signal.
+13. COMPREHENSIVE FINAL SUMMARY:
+   - You MUST NOT end any final response without a comprehensive and structured summary section titled "**✅ 任务完成总结**".
+   - This section must provide a complete overview of the session, including:
+     - **Execution Logic**: 2-3 sentences of natural language describing the approach and technical rationale.
+     - **Action Checklist**: A list of all completed tasks from your "📋 任务规划".
+     - **File Change Table**: A Markdown table listing all modified/created files with paths, status, line counts, and a brief description of the change.
+     - **Verification & Decision**: Summary of verification results (e.g., syntax checks, test runs) and any major technical decisions made.
+    - If no files were modified, explicitly state "未修改文件".
+    - Use clear formatting (headers, tables, bullets) to ensure the summary is professional and exhaustive.
+    - Markdown tables MUST include a header row, separator row, and one row per changed file. Put blank lines around the table so the UI renders it as a real table instead of one paragraph.
+    - Do not emit the final summary as one dense paragraph. Each section must be separated by a blank line.
+    - The final summary must be sent as normal assistant content, not as a progress update or reasoning-only content.
+    - If a table would be too large, include the most relevant changed files and then add a short "其他" row; never convert the table into plain inline text.
 
 14. ENCODING: Avoid Chinese text mojibake. When creating, modifying, reading, or printing scripts, source files, JSON, Markdown, batch files, or PowerShell files that contain Chinese text, use UTF-8 explicitly. On Windows PowerShell, prefix commands that may read or print Chinese with \$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(\$false); chcp 65001 | Out-Null;. Use explicit flags such as PowerShell \`Get-Content -Encoding utf8\`, \`Set-Content -Encoding utf8\`, \`Out-File -Encoding utf8\`, Node.js \`fs.readFileSync(path, "utf8")\` / \`fs.writeFileSync(path, content, "utf8")\`, and Python \`open(path, encoding="utf-8")\` / \`open(path, "w", encoding="utf-8")\`. Do not rely on Windows legacy console code pages or default file encodings for Chinese text.
    - If Chinese output appears garbled, first suspect encoding boundaries: terminal code page, PowerShell input/output encoding, file read/write encoding, response charset, and copied text from external tools.
