@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -804,6 +804,52 @@ function sendDone(res, id, model, created = Math.floor(Date.now() / 1000)) {
   res.end();
 }
 
+let agentMemoryCache = { data: "", mtime: 0, lastScan: 0 };
+
+function getAgentMemoryPrompt() {
+  const memoryPath = path.join(process.cwd(), ".agent_memory.json");
+  const now = Date.now();
+  
+  if (!fs.existsSync(memoryPath)) {
+    agentMemoryCache.mtime = 0;
+    agentMemoryCache.data = "";
+    return "";
+  }
+
+  // Fast path TTL check
+  if (now - agentMemoryCache.lastScan < 5000) {
+    return agentMemoryCache.data;
+  }
+
+  const currentMtime = fs.statSync(memoryPath).mtimeMs;
+  agentMemoryCache.lastScan = now;
+
+  if (agentMemoryCache.mtime === currentMtime) {
+    return agentMemoryCache.data;
+  }
+
+  let agentMemoryPrompt = "";
+  try {
+    const buffer = fs.readFileSync(memoryPath);
+    let memoryData;
+    try {
+      const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+      memoryData = utf8Decoder.decode(buffer);
+    } catch (e) {
+      const gbkDecoder = new TextDecoder("gbk");
+      memoryData = gbkDecoder.decode(buffer);
+    }
+    JSON.parse(memoryData);
+    agentMemoryPrompt = `\n[Agent Persistent Memory]\nHere is your remembered context from previous sessions:\n\`\`\`json\n${memoryData}\n\`\`\`\nUse this memory to maintain context and avoid repeating mistakes or asking for the same information twice.\n`;
+  } catch (err) {
+    console.error("[Codex Bridge] Failed to read agent memory:", err.message);
+  }
+
+  agentMemoryCache.mtime = currentMtime;
+  agentMemoryCache.data = agentMemoryPrompt;
+  return agentMemoryPrompt;
+}
+
 function buildPrompt(messages, tools = []) {
   const normalized = messages
     .map((message) => ({
@@ -833,26 +879,8 @@ ${JSON.stringify(tools, null, 2)}
 `;
   }
 
-  // Load persistent agent memory if it exists
-  let agentMemoryPrompt = "";
-  const memoryPath = path.join(process.cwd(), ".agent_memory.json");
-  if (fs.existsSync(memoryPath)) {
-    try {
-      const buffer = fs.readFileSync(memoryPath);
-      let memoryData;
-      try {
-        const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
-        memoryData = utf8Decoder.decode(buffer);
-      } catch (e) {
-        const gbkDecoder = new TextDecoder("gbk");
-        memoryData = gbkDecoder.decode(buffer);
-      }
-      JSON.parse(memoryData);
-      agentMemoryPrompt = `\n[Agent Persistent Memory]\nHere is your remembered context from previous sessions:\n\`\`\`json\n${memoryData}\n\`\`\`\nUse this memory to maintain context and avoid repeating mistakes or asking for the same information twice.\n`;
-    } catch (err) {
-      console.error("[Codex Bridge] Failed to read agent memory:", err.message);
-    }
-  }
+  // Load persistent agent memory if it exists (now cached)
+  let agentMemoryPrompt = getAgentMemoryPrompt();
 
   const systemPrompt = `[System Instructions]
 You are a HIGHLY AUTONOMOUS ELITE DEVELOPER. You don't just follow instructions; you solve problems with extreme technical depth and creativity.
@@ -998,11 +1026,50 @@ ${agentMemoryPrompt}${skillPrompt}${clientToolsPrompt}`;
   ].join("\n\n");
 }
 
+// Caching for optimizations (AIAgent Performance)
+let skillsCache = { data: null, lastScan: 0, mtimes: new Map() };
+
+function getDirMaxMtime(dir) {
+  if (!fs.existsSync(dir)) return 0;
+  let maxTime = fs.statSync(dir).mtimeMs;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const filePath = path.join(dir, entry.name, "SKILL.md");
+        if (fs.existsSync(filePath)) {
+          maxTime = Math.max(maxTime, fs.statSync(filePath).mtimeMs);
+        }
+      }
+    }
+  } catch (e) {}
+  return maxTime;
+}
+
 function loadSkills() {
   const dirsToScan = [
     SKILLS_DIR,
     path.join(os.homedir(), ".workbuddy", "skills-marketplace", "skills"),
   ];
+
+  const now = Date.now();
+  let cacheValid = skillsCache.data !== null && (now - skillsCache.lastScan < 5000); // Fast path 5s TTL
+  
+  if (!cacheValid) {
+    cacheValid = true;
+    for (const dir of dirsToScan) {
+      const currentMtime = getDirMaxMtime(dir);
+      if (skillsCache.mtimes.get(dir) !== currentMtime) {
+        cacheValid = false;
+        skillsCache.mtimes.set(dir, currentMtime);
+      }
+    }
+    skillsCache.lastScan = now;
+  }
+
+  if (cacheValid) {
+    return skillsCache.data;
+  }
 
   const allSkills = [];
 
@@ -1038,6 +1105,7 @@ function loadSkills() {
     allSkills.push(...entries);
   }
 
+  skillsCache.data = allSkills;
   return allSkills;
 }
 
